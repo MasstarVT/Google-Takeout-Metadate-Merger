@@ -1,14 +1,14 @@
 # Python script to merge metadata from Google Photos JSON files into media files.
 #
-# This script handles JPG, JPEG, PNG, WEBP, HEIC, GIF, MP4, MKV, FLV, and MP files.
+# This script handles JPG, JPEG, PNG, WEBP, HEIC, GIF, MP4, MKV, FLV, MOV, and MP files.
+# It also handles RAW files (NEF, CR2, ARW, DNG) by updating their file system
+# "Date modified" to match the JSON data, but it does NOT modify their internal
+# EXIF data, as this can be risky without specialized tools.
+#
 # It recursively searches through all subfolders to find and process files.
 # It reads metadata (like creation date and GPS) from .json files and writes
-# it into the corresponding media files. It also updates the file's
-# "Date modified" to match the "Date taken".
-#
-# NOTE: This script does NOT handle RAW files (like .NEF, .CR2, etc.) because
-# modifying them safely requires specialized external tools like ExifTool. This
-# script relies only on Python libraries to avoid external dependencies.
+# it into the corresponding media files (for non-RAW files). It updates the
+# file's "Date modified" for ALL supported file types.
 #
 # --- REQUIREMENTS ---
 # 1. Python Libraries: You need to install 'piexif', 'mutagen', and 'pillow-heif'.
@@ -169,12 +169,13 @@ def main():
     skipped_files = 0
     processed_media_basenames = set() 
 
-    supported_extensions = ('.jpg', '.jpeg', '.mp4', '.mkv', '.heic', '.gif', '.flv', '.png', '.webp', '.mp')
-    raw_extensions = ('.nef', '.cr2', '.arw', '.dng')
+    # Add RAW file extensions to the list of supported files.
+    # They will be processed to update their file system timestamp, but their
+    # internal metadata will not be modified to prevent corruption.
+    supported_extensions = ('.jpg', '.jpeg', '.mp4', '.mkv', '.heic', '.gif', '.flv', '.png', '.webp', '.mp', '.nef', '.cr2', '.arw', '.dng', '.mov')
     
     all_media_files = []
     all_json_files = []
-    all_raw_files = []
     
     for dirpath, dirnames, filenames in os.walk(root_directory):
         # Skip the 'Completed' directory during the initial file scan
@@ -188,17 +189,12 @@ def main():
             ext = ext.lower()
             if ext in supported_extensions:
                 all_media_files.append(full_path)
-            elif ext in raw_extensions:
-                all_raw_files.append(full_path)
             elif ext == '.json':
                 all_json_files.append(full_path)
 
     if not all_media_files:
         logging.info(f"No supported files found ({', '.join(supported_extensions)}).")
     
-    if all_raw_files:
-        logging.info(f"\nFound {len(all_raw_files)} RAW files. They will be skipped to prevent data corruption, as modifying them safely requires external tools outside of Python.")
-
     logging.info(f"Found {len(all_media_files)} supported files to process.")
 
     for media_filepath in all_media_files:
@@ -214,8 +210,8 @@ def main():
                 if 'photoTakenTime' in metadata and 'timestamp' in metadata['photoTakenTime']:
                     timestamp = int(metadata['photoTakenTime']['timestamp'])
                     dt_object = datetime.fromtimestamp(timestamp)
-                    _, file_ext = os.path.splitext(filename)
-                    file_ext = file_ext.lower().replace('.', '')
+                    _, file_ext_with_dot = os.path.splitext(filename)
+                    file_ext = file_ext_with_dot.lower().replace('.', '')
 
 
                     # --- Attempt to write internal metadata (EXIF, video tags) ---
@@ -261,7 +257,7 @@ def main():
                                 with Image.open(media_filepath) as image:
                                     image.save(media_filepath, exif=exif_bytes)
 
-                        elif file_ext in ['mp4', 'mkv', 'gif', 'flv', 'mp']:
+                        elif file_ext in ['mp4', 'mkv', 'gif', 'flv', 'mp', 'mov']:
                             video = mutagen.File(media_filepath)
                             if video is not None:
                                 utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
@@ -276,6 +272,9 @@ def main():
                                 logging.info(f"  - Found and set {file_ext.upper()} internal creation date to: {date_str_iso}")
                             else:
                                 logging.warning(f"  - Could not write internal metadata for '{filename}' (unsupported by mutagen).")
+                        
+                        elif file_ext in ['nef', 'cr2', 'arw', 'dng']:
+                             logging.info(f"  - Found RAW file. Internal metadata will not be changed.")
 
                     except Exception as e:
                         logging.warning(f"  - Failed to write internal metadata for '{filename}': {e}")
@@ -316,7 +315,7 @@ def main():
     logging.info("      COMPLETE      ")
     logging.info("--------------------")
     logging.info(f"Processed: {processed_files} files")
-    logging.info(f"Skipped:   {skipped_files + len(all_raw_files)} files (including RAW files)")
+    logging.info(f"Skipped:   {skipped_files} files")
 
     if processed_media_basenames:
         logging.info("\n")
