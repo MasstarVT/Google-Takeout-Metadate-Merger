@@ -120,6 +120,28 @@ def find_json_for_media(media_filepath, all_json_files):
 
     return None
 
+def delete_empty_folders(root_dir):
+    """Walks through a directory and removes any empty subfolders."""
+    deleted_folders_count = 0
+    # Walk the directory tree from the bottom up
+    for dirpath, dirnames, filenames in os.walk(root_dir, topdown=False):
+        # Don't try to delete the root directory itself
+        if os.path.abspath(dirpath) == os.path.abspath(root_dir):
+            continue
+            
+        if not dirnames and not filenames:
+            try:
+                os.rmdir(dirpath)
+                logging.info(f"  - Deleted empty folder: '{dirpath}'")
+                deleted_folders_count += 1
+            except OSError as e:
+                logging.error(f"  - Error deleting folder '{dirpath}': {e}")
+    if deleted_folders_count > 0:
+        logging.info(f"\nSuccessfully deleted {deleted_folders_count} empty folders.")
+    else:
+        logging.info("\nNo empty folders found to delete.")
+
+
 def main():
     """Main function to process media files in the specified directory."""
     root_directory = '.'
@@ -145,7 +167,7 @@ def main():
     logging.info(f"Starting recursive metadata merge in directory: {os.path.abspath(root_directory)}")
     processed_files = 0
     skipped_files = 0
-    used_json_files = [] 
+    processed_media_basenames = set() 
 
     supported_extensions = ('.jpg', '.jpeg', '.mp4', '.mkv', '.heic', '.gif', '.flv', '.png', '.webp', '.mp')
     raw_extensions = ('.nef', '.cr2', '.arw', '.dng')
@@ -155,6 +177,7 @@ def main():
     all_raw_files = []
     
     for dirpath, dirnames, filenames in os.walk(root_directory):
+        # Skip the 'Completed' directory during the initial file scan
         if os.path.abspath(dirpath).startswith(os.path.abspath(completed_directory)):
             continue
             
@@ -269,8 +292,14 @@ def main():
                     shutil.move(media_filepath, destination_filepath)
                     logging.info(f"  - Moved '{filename}' to '{destination_dir}'")
                     
+                    # Add the base name of the processed file to a set for later cleanup
+                    base_name_for_cleanup, _ = os.path.splitext(filename)
+                    # Normalize names like 'IMG_1234(1)' or 'IMG_1234-edited' to get the true base
+                    base_name_for_cleanup = re.sub(r'\(\d+\)$', '', base_name_for_cleanup)
+                    base_name_for_cleanup = re.sub(r'[-_]edited$', '', base_name_for_cleanup, flags=re.IGNORECASE)
+                    processed_media_basenames.add(base_name_for_cleanup)
+                    
                     processed_files += 1
-                    used_json_files.append(json_filepath)
 
                 else:
                     logging.info("  - No 'photoTakenTime' found in JSON. Skipping metadata update.")
@@ -289,10 +318,11 @@ def main():
     logging.info(f"Processed: {processed_files} files")
     logging.info(f"Skipped:   {skipped_files + len(all_raw_files)} files (including RAW files)")
 
-    if used_json_files:
+    if processed_media_basenames:
         logging.info("\n")
         while True:
-            delete_choice = input(f"Do you want to delete the {len(list(set(used_json_files)))} successfully used JSON files? (yes/no): ").lower().strip()
+            prompt_message = f"Do you want to delete all JSON files corresponding to the {len(processed_media_basenames)} successfully processed media items? (yes/no): "
+            delete_choice = input(prompt_message).lower().strip()
             if delete_choice in ['yes', 'y', 'no', 'n']:
                 break
             else:
@@ -300,17 +330,39 @@ def main():
 
         if delete_choice in ['yes', 'y']:
             deleted_count = 0
-            logging.info("\nDeleting JSON files...")
-            for json_file in list(set(used_json_files)):
-                try:
-                    os.remove(json_file)
-                    logging.info(f"  - Deleted '{os.path.basename(json_file)}' from '{os.path.dirname(json_file)}'")
-                    deleted_count += 1
-                except OSError as e:
-                    logging.error(f"  - Error deleting '{json_file}': {e}")
+            logging.info("\nDeleting related JSON files...")
+            # Re-iterate through all found JSON files to find all matches
+            for json_path in all_json_files:
+                json_filename = os.path.basename(json_path)
+                # Check if this JSON file belongs to any of the processed media
+                for base_name in processed_media_basenames:
+                    if json_filename.startswith(base_name):
+                        try:
+                            os.remove(json_path)
+                            logging.info(f"  - Deleted '{os.path.basename(json_path)}' from '{os.path.dirname(json_path)}'")
+                            deleted_count += 1
+                            # Once deleted, break inner loop to avoid trying to delete it again
+                            break 
+                        except OSError as e:
+                            logging.error(f"  - Error deleting '{json_path}': {e}")
             logging.info(f"\nSuccessfully deleted {deleted_count} JSON files.")
         else:
             logging.info("\nSkipping JSON file deletion.")
+
+    # --- Clean up empty folders ---
+    logging.info("\n")
+    while True:
+        cleanup_choice = input("Do you want to delete any empty folders that are left? (yes/no): ").lower().strip()
+        if cleanup_choice in ['yes', 'y', 'no', 'n']:
+            break
+        else:
+            logging.warning("Invalid input. Please enter 'yes' or 'no'.")
+    
+    if cleanup_choice in ['yes', 'y']:
+        logging.info("\nChecking for empty folders to delete...")
+        delete_empty_folders(root_directory)
+    else:
+        logging.info("\nSkipping empty folder cleanup.")
 
 
 if __name__ == '__main__':
