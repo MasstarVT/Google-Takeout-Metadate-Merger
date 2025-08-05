@@ -1,28 +1,31 @@
-# Python script to merge metadata from Google Photos JSON files into JPG and MP4 files.
+# Python script to merge metadata from Google Photos JSON files into media files.
 #
-# This script reads metadata (like creation date) from .json
-# files and writes it into the EXIF data of corresponding .jpg files or the
-# metadata tags of .mp4 files. It also updates the file's "Date modified"
-# to match the "Date taken".
+# This script handles JPG, MP4, and MKV files.
+# It reads metadata (like creation date and GPS) from .json files and writes
+# it into the corresponding media files. It also updates the file's
+# "Date modified" to match the "Date taken".
 #
-# REQUIREMENTS:
-# You need to install the 'piexif' and 'mutagen' libraries.
-# You can install them by running:
-# pip install piexif mutagen
+# NOTE: This script does NOT handle RAW files (like .NEF, .CR2, etc.) because
+# modifying them safely requires specialized external tools like ExifTool. This
+# script relies only on Python libraries to avoid external dependencies.
 #
-# HOW TO USE:
+# --- REQUIREMENTS ---
+# 1. Python Libraries: You need to install 'piexif' and 'mutagen'.
+#    Run this command in your terminal:
+#    pip install piexif mutagen
+#
+# --- HOW TO USE ---
 # 1. Save this script as a Python file (e.g., merge_metadata.py).
 # 2. Place this script in the same folder that contains your media and .json files.
-#    Alternatively, you can modify the 'media_directory' variable below to point
-#    to the correct folder.
 # 3. IMPORTANT: It's highly recommended to back up your files before running
 #    this script, as it will overwrite the original files.
 # 4. Run the script from your terminal: python merge_metadata.py
 
 import os
 import json
+import re
 import piexif
-import mutagen.mp4
+import mutagen
 from datetime import datetime, timezone
 
 def to_deg(value, loc):
@@ -56,36 +59,49 @@ def set_gps_location(exif_dict, lat, lon):
 
 def find_json_for_media(media_filename, all_files, directory):
     """
-    Finds the corresponding JSON file for a given media file.
-    Google Takeout can have several naming conventions.
+    Finds the corresponding JSON file for a given media file, handling various
+    Google Takeout naming conventions like edited or numbered files.
     """
-    base_name, _ = os.path.splitext(media_filename)
+    base_name, ext = os.path.splitext(media_filename) # e.g., 'photo(1)', '.jpg'
+
+    # --- Priority 1: Check for exact matches based on various patterns ---
+    search_candidates = []
+    # Case 1: Standard names ('photo.jpg.json', 'photo.json')
+    search_candidates.append(f"{media_filename}.json")
+    search_candidates.append(f"{base_name}.json")
+
+    # Case 2: Numbered files ('photo(1).jpg' -> 'photo.jpg(1).json')
+    match = re.match(r'(.+?)\s*\(\d+\)$', base_name)
+    if match:
+        original_base = match.group(1).strip()
+        numbered_part = base_name[len(original_base):]
+        search_candidates.append(f"{original_base}{ext}{numbered_part}.json")
+
+    # Case 3: Edited files ('photo-edited.jpg' -> 'photo.jpg.json')
+    if base_name.lower().endswith(('-edited', '_edited')):
+        original_base = re.sub(r'[-_]edited$', '', base_name, flags=re.IGNORECASE)
+        search_candidates.append(f"{original_base}{ext}.json")
+        search_candidates.append(f"{original_base}.json")
+
+    for candidate in search_candidates:
+        if candidate in all_files:
+            return os.path.join(directory, candidate)
     
-    potential_exact_matches = [
-        f"{media_filename}.json",
-        f"{base_name}.json"
-    ]
-
-    for json_name in potential_exact_matches:
-        if json_name in all_files:
-            return os.path.join(directory, json_name)
-
+    # --- Priority 2: If no exact match, try a 'startswith' search for supplemental files ---
+    # This is broader and handles cases like 'photo.jpg.supplemental-metadata.json'
     for f in all_files:
-        if f.startswith(media_filename) and f.lower().endswith('.json'):
+        if f.lower().endswith('.json') and f.startswith(media_filename):
             return os.path.join(directory, f)
-
+            
     for f in all_files:
-        if f.startswith(base_name) and f.lower().endswith('.json'):
+        if f.lower().endswith('.json') and f.startswith(base_name):
             return os.path.join(directory, f)
 
     return None
 
 def main():
-    """
-    Main function to process media files in the specified directory.
-    """
+    """Main function to process media files in the specified directory."""
     media_directory = '.'
-
     print(f"Starting metadata merge in directory: {os.path.abspath(media_directory)}")
     processed_files = 0
     skipped_files = 0
@@ -97,13 +113,18 @@ def main():
         print(f"Error: Directory not found at '{media_directory}'. Please check the path.")
         return
 
-    media_files = [f for f in all_files if f.lower().endswith(('.jpg', '.jpeg', '.mp4'))]
+    media_files = [f for f in all_files if f.lower().endswith(('.jpg', '.jpeg', '.mp4', '.mkv'))]
+    raw_files = [f for f in all_files if f.lower().endswith(('.nef', '.cr2', '.arw', '.dng'))]
 
     if not media_files:
-        print("No JPG, JPEG, or MP4 files found in the directory.")
-        return
+        print("No JPG, JPEG, MP4, or MKV files found to process.")
+    
+    if raw_files:
+        print(f"\nFound {len(raw_files)} RAW files. They will be skipped to prevent data corruption,")
+        print("as modifying them safely requires external tools outside of Python.")
 
-    print(f"Found {len(media_files)} media files to process.")
+
+    print(f"\nFound {len(media_files)} supported files to process (JPG, MP4, MKV).")
 
     for filename in media_files:
         media_filepath = os.path.join(media_directory, filename)
@@ -120,8 +141,10 @@ def main():
                     timestamp = int(metadata['photoTakenTime']['timestamp'])
                     dt_object = datetime.fromtimestamp(timestamp)
                     
+                    file_ext = filename.lower().split('.')[-1]
+
                     # --- Handle JPG files ---
-                    if filename.lower().endswith(('.jpg', '.jpeg')):
+                    if file_ext in ['jpg', 'jpeg']:
                         try:
                             exif_dict = piexif.load(media_filepath)
                         except (piexif.InvalidImageDataError, ValueError):
@@ -134,7 +157,7 @@ def main():
                         exif_dict['0th'][piexif.ImageIFD.DateTime] = date_str.encode('utf-8')
                         print(f"  - Found and set EXIF date to: {date_str}")
                         
-                        if 'geoData' in metadata and metadata['geoData']['latitude'] != 0.0:
+                        if 'geoData' in metadata and 'latitude' in metadata['geoData'] and metadata['geoData']['latitude'] != 0.0:
                             lat = metadata['geoData']['latitude']
                             lon = metadata['geoData']['longitude']
                             exif_dict = set_gps_location(exif_dict, lat, lon)
@@ -143,17 +166,26 @@ def main():
                         exif_bytes = piexif.dump(exif_dict)
                         piexif.insert(exif_bytes, media_filepath)
 
-                    # --- Handle MP4 files ---
-                    elif filename.lower().endswith('.mp4'):
-                        video = mutagen.mp4.MP4(media_filepath)
-                        # The '\xa9day' atom stores the creation date in ISO 8601 format.
+                    # --- Handle MP4 and MKV files ---
+                    elif file_ext in ['mp4', 'mkv']:
+                        video = mutagen.File(media_filepath)
+                        if video is None:
+                            print(f"  - Could not process video file with mutagen. Skipping.")
+                            skipped_files += 1
+                            continue
+                        
                         utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
                         date_str_iso = utc_dt.isoformat()
-                        video['\xa9day'] = date_str_iso
+                        
+                        if video.tags is None:
+                            video.add_tags()
+                        
+                        tag_key = 'DATE_RECORDED' if file_ext == 'mkv' else '\xa9day'
+                        video.tags[tag_key] = date_str_iso
                         video.save()
-                        print(f"  - Found and set MP4 creation date to: {date_str_iso}")
+                        print(f"  - Found and set {file_ext.upper()} creation date to: {date_str_iso}")
 
-                    # Update the file's modified date for both types
+                    # Update the file's modified date for all types
                     if timestamp:
                         os.utime(media_filepath, (timestamp, timestamp))
                         print(f"  - Set file 'Date modified' to match 'Date taken'.")
@@ -177,7 +209,7 @@ def main():
     print("      COMPLETE      ")
     print("--------------------")
     print(f"Processed: {processed_files} files")
-    print(f"Skipped:   {skipped_files} files")
+    print(f"Skipped:   {skipped_files + len(raw_files)} files (including RAW files)")
 
     if used_json_files:
         print("\n")
