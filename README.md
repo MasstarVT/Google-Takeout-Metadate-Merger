@@ -5,13 +5,14 @@
  it into the corresponding media files. It also updates the file's
  "Date modified" to match the "Date taken".
 
-# NOTE: This script does NOT handle RAW files (like .NEF, .CR2, etc.) because
- modifying them safely requires specialized external tools like ExifTool. This
+# NOTE: This script does NOT handle RAW files (like .NEF, .CR2, etc.) 
+ because modifying them safely requires specialized external tools like ExifTool. This
  script relies only on Python libraries to avoid external dependencies.
 
 # REQUIREMENTS:
  1. Python Libraries: You need to install 'piexif', 'mutagen', and 'pillow-heif'.
     Run this command in your terminal:
+
     pip install piexif mutagen pillow-heif
 
 # HOW TO USE:
