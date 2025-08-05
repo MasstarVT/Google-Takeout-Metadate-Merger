@@ -1,6 +1,7 @@
 # Python script to merge metadata from Google Photos JSON files into media files.
 #
-# This script handles JPG, JPEG, HEIC, GIF, MP4, MKV, and FLV files.
+# This script handles JPG, JPEG, PNG, WEBP, HEIC, GIF, MP4, MKV, FLV, and MP files.
+# It recursively searches through all subfolders to find and process files.
 # It reads metadata (like creation date and GPS) from .json files and writes
 # it into the corresponding media files. It also updates the file's
 # "Date modified" to match the "Date taken".
@@ -16,7 +17,7 @@
 #
 # --- HOW TO USE ---
 # 1. Save this script as a Python file (e.g., merge_metadata.py).
-# 2. Place this script in the same folder that contains your media and .json files.
+# 2. Place this script in the root folder of your photo collection.
 # 3. IMPORTANT: It's highly recommended to back up your files before running
 #    this script, as it will overwrite the original files.
 # 4. Run the script from your terminal: python merge_metadata.py
@@ -27,9 +28,13 @@ import re
 import shutil
 import piexif
 import mutagen
+import logging
 from datetime import datetime, timezone
-from PIL import Image
+from PIL import Image, ImageFile
 import pillow_heif
+
+# Allow loading of truncated images, which can prevent errors with corrupted files.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # Register the HEIF opener with Pillow
 pillow_heif.register_heif_opener()
@@ -63,243 +68,249 @@ def set_gps_location(exif_dict, lat, lon):
     }
     return exif_dict
 
-def find_json_for_media(media_filename, all_files, directory):
+def find_json_for_media(media_filepath, all_json_files):
     """
-    Finds the corresponding JSON file for a given media file, handling various
-    Google Takeout naming conventions like edited or numbered files.
+    Finds the corresponding JSON file for a given media file from a list of all JSON files.
     """
-    base_name, ext = os.path.splitext(media_filename) # e.g., 'photo(1)', '.jpg'
+    media_filename = os.path.basename(media_filepath)
+    base_name, ext = os.path.splitext(media_filename)
+
+    # Create a map for quick lookups, storing full paths
+    json_map = {os.path.basename(f): f for f in all_json_files}
 
     search_candidates = []
+    # Exact match first
     search_candidates.append(f"{media_filename}.json")
     search_candidates.append(f"{base_name}.json")
 
+    # Handle numbered files like 'image(1).jpg' -> 'image.jpg(1).json'
     match = re.match(r'(.+?)\s*\(\d+\)$', base_name)
     if match:
         original_base = match.group(1).strip()
         numbered_part = base_name[len(original_base):]
         search_candidates.append(f"{original_base}{ext}{numbered_part}.json")
 
+    # Handle edited files like 'image-edited.jpg' -> 'image.jpg.json'
     if base_name.lower().endswith(('-edited', '_edited')):
         original_base = re.sub(r'[-_]edited$', '', base_name, flags=re.IGNORECASE)
         search_candidates.append(f"{original_base}{ext}.json")
         search_candidates.append(f"{original_base}.json")
 
     for candidate in search_candidates:
-        if candidate in all_files:
-            return os.path.join(directory, candidate)
-    
-    for f in all_files:
-        if f.lower().endswith('.json') and f.startswith(media_filename):
-            return os.path.join(directory, f)
-            
-    for f in all_files:
-        if f.lower().endswith('.json') and f.startswith(base_name):
-            return os.path.join(directory, f)
+        if candidate in json_map:
+            return json_map[candidate]
+
+    # Broader search for cases where the JSON name is a subset of the media name
+    # e.g., media='Screenshot_20210216-201518_Reddit.jpg', json='Screenshot_20210216-201518.jpg.json'
+    media_dir = os.path.dirname(media_filepath)
+    for json_path in all_json_files:
+        if os.path.dirname(json_path) == media_dir:
+            json_filename = os.path.basename(json_path)
+            # Check if the json filename (without its own .json ext) is a prefix of the media filename
+            json_base, _ = os.path.splitext(json_filename)
+            if media_filename.startswith(json_base):
+                return json_path
+
+    # Final fallback for supplemental files
+    for json_path in all_json_files:
+        if os.path.dirname(json_path) == media_dir:
+            json_filename = os.path.basename(json_path)
+            if json_filename.startswith(media_filename) or json_filename.startswith(base_name):
+                 return json_path
 
     return None
 
-def cleanup_duplicate_jsons(directory, all_files):
-    """Identifies and offers to delete duplicate JSON files based on '(number)' suffixes."""
-    print("\n--- Checking for duplicate JSON files ---")
-    json_files = [f for f in all_files if f.lower().endswith('.json')]
-    base_filenames = {}
-    
-    for f in json_files:
-        base_name = re.sub(r'\(\d+\)', '', f)
-        if base_name not in base_filenames:
-            base_filenames[base_name] = []
-        base_filenames[base_name].append(f)
-        
-    duplicate_files_to_delete = []
-    for base_name, files in base_filenames.items():
-        if len(files) > 1:
-            files.sort(key=len)
-            duplicates_in_group = files[1:]
-            duplicate_files_to_delete.extend(duplicates_in_group)
-            print(f"Found duplicate group for '{files[0]}': {', '.join(duplicates_in_group)}")
-
-    if not duplicate_files_to_delete:
-        print("No duplicate JSON files found.")
-        return all_files
-
-    print(f"\nFound {len(duplicate_files_to_delete)} potential duplicate JSON files.")
-    
-    while True:
-        delete_choice = input("Do you want to delete these duplicate JSON files? (yes/no): ").lower().strip()
-        if delete_choice in ['yes', 'y', 'no', 'n']:
-            break
-        else:
-            print("Invalid input. Please enter 'yes' or 'no'.")
-
-    if delete_choice in ['yes', 'y']:
-        deleted_count = 0
-        print("\nDeleting duplicate JSON files...")
-        for json_file_to_delete in duplicate_files_to_delete:
-            try:
-                os.remove(os.path.join(directory, json_file_to_delete))
-                print(f"  - Deleted '{json_file_to_delete}'")
-                deleted_count += 1
-            except OSError as e:
-                print(f"  - Error deleting '{json_file_to_delete}': {e}")
-        print(f"\nSuccessfully deleted {deleted_count} duplicate JSON files.")
-        return os.listdir(directory)
-    else:
-        print("\nSkipping duplicate JSON file deletion.")
-        return all_files
-
 def main():
     """Main function to process media files in the specified directory."""
-    media_directory = '.'
-    completed_directory = os.path.join(media_directory, "Completed")
+    root_directory = '.'
+    completed_directory = os.path.join(root_directory, "Completed")
+    log_file = os.path.join(root_directory, "metadata_merge.log")
+
+    # --- Setup Logging ---
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, mode='w'), # 'w' to overwrite the log each run
+            logging.StreamHandler()
+        ]
+    )
+    logging.info(f"Log file created at: {os.path.abspath(log_file)}")
+    # ---
 
     if not os.path.exists(completed_directory):
         os.makedirs(completed_directory)
-        print(f"Created folder: '{completed_directory}'")
+        logging.info(f"Created folder: '{completed_directory}'")
 
-    print(f"\nStarting metadata merge in directory: {os.path.abspath(media_directory)}")
+    logging.info(f"Starting recursive metadata merge in directory: {os.path.abspath(root_directory)}")
     processed_files = 0
     skipped_files = 0
     used_json_files = [] 
 
-    try:
-        all_files = os.listdir(media_directory)
-    except FileNotFoundError:
-        print(f"Error: Directory not found at '{media_directory}'. Please check the path.")
-        return
-
-    all_files = cleanup_duplicate_jsons(media_directory, all_files)
-
-    supported_extensions = ('.jpg', '.jpeg', '.mp4', '.mkv', '.heic', '.gif', '.flv')
-    media_files = [f for f in all_files if f.lower().endswith(supported_extensions)]
-    raw_files = [f for f in all_files if f.lower().endswith(('.nef', '.cr2', '.arw', '.dng'))]
-
-    if not media_files:
-        print(f"No supported files found ({', '.join(supported_extensions)}).")
+    supported_extensions = ('.jpg', '.jpeg', '.mp4', '.mkv', '.heic', '.gif', '.flv', '.png', '.webp', '.mp')
+    raw_extensions = ('.nef', '.cr2', '.arw', '.dng')
     
-    if raw_files:
-        print(f"\nFound {len(raw_files)} RAW files. They will be skipped to prevent data corruption,")
-        print("as modifying them safely requires external tools outside of Python.")
+    all_media_files = []
+    all_json_files = []
+    all_raw_files = []
+    
+    for dirpath, dirnames, filenames in os.walk(root_directory):
+        if os.path.abspath(dirpath).startswith(os.path.abspath(completed_directory)):
+            continue
+            
+        for filename in filenames:
+            full_path = os.path.join(dirpath, filename)
+            # Use os.path.splitext for a more reliable way to get the extension
+            _, ext = os.path.splitext(filename)
+            ext = ext.lower()
+            if ext in supported_extensions:
+                all_media_files.append(full_path)
+            elif ext in raw_extensions:
+                all_raw_files.append(full_path)
+            elif ext == '.json':
+                all_json_files.append(full_path)
 
+    if not all_media_files:
+        logging.info(f"No supported files found ({', '.join(supported_extensions)}).")
+    
+    if all_raw_files:
+        logging.info(f"\nFound {len(all_raw_files)} RAW files. They will be skipped to prevent data corruption, as modifying them safely requires external tools outside of Python.")
 
-    print(f"\nFound {len(media_files)} supported files to process.")
+    logging.info(f"Found {len(all_media_files)} supported files to process.")
 
-    for filename in media_files:
-        media_filepath = os.path.join(media_directory, filename)
-        json_filepath = find_json_for_media(filename, all_files, media_directory)
+    for media_filepath in all_media_files:
+        filename = os.path.basename(media_filepath)
+        json_filepath = find_json_for_media(media_filepath, all_json_files)
 
         if json_filepath:
-            print(f"\nProcessing '{filename}' with JSON '{os.path.basename(json_filepath)}'...")
+            logging.info(f"\nProcessing '{media_filepath}' with JSON '{os.path.basename(json_filepath)}'...")
             try:
                 with open(json_filepath, 'r', encoding='utf-8') as f:
                     metadata = json.load(f)
 
-                timestamp = None
                 if 'photoTakenTime' in metadata and 'timestamp' in metadata['photoTakenTime']:
                     timestamp = int(metadata['photoTakenTime']['timestamp'])
                     dt_object = datetime.fromtimestamp(timestamp)
+                    _, file_ext = os.path.splitext(filename)
+                    file_ext = file_ext.lower().replace('.', '')
+
+
+                    # --- Attempt to write internal metadata (EXIF, video tags) ---
+                    try:
+                        if file_ext in ['jpg', 'jpeg', 'heic', 'png', 'webp']:
+                            exif_dict = {}
+                            try:
+                                if file_ext in ['heic', 'png', 'webp']:
+                                    with Image.open(media_filepath) as image:
+                                        exif_dict = piexif.load(image.info.get('exif', b''))
+                                else: # For JPG/JPEG
+                                    exif_dict = piexif.load(media_filepath)
+                            except Exception:
+                                logging.info(f"  - No valid EXIF data in '{filename}'. Creating new EXIF data.")
+                                exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+                            
+                            date_str = dt_object.strftime("%Y:%m:%d %H:%M:%S")
+                            exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = date_str.encode('utf-8')
+                            exif_dict['Exif'][piexif.ExifIFD.DateTimeDigitized] = date_str.encode('utf-8')
+                            exif_dict['0th'][piexif.ImageIFD.DateTime] = date_str.encode('utf-8')
+                            logging.info(f"  - Found and set EXIF date to: {date_str}")
+                            
+                            if 'geoData' in metadata and 'latitude' in metadata['geoData'] and metadata['geoData']['latitude'] != 0.0:
+                                lat = metadata['geoData']['latitude']
+                                lon = metadata['geoData']['longitude']
+                                exif_dict = set_gps_location(exif_dict, lat, lon)
+                                logging.info(f"  - Found and set GPS to: Lat {lat}, Lon {lon}")
+                            
+                            for ifd_name in exif_dict:
+                                if ifd_name == 'thumbnail':
+                                    continue
+                                keys_to_delete = [tag for tag, value in exif_dict[ifd_name].items() if isinstance(value, int)]
+                                if keys_to_delete:
+                                    for key in keys_to_delete:
+                                        del exif_dict[ifd_name][key]
+                            
+                            exif_dict['thumbnail'] = None
+                            exif_bytes = piexif.dump(exif_dict)
+                            
+                            if file_ext in ['jpg', 'jpeg']:
+                                 piexif.insert(exif_bytes, media_filepath)
+                            elif file_ext in ['heic', 'png', 'webp']:
+                                with Image.open(media_filepath) as image:
+                                    image.save(media_filepath, exif=exif_bytes)
+
+                        elif file_ext in ['mp4', 'mkv', 'gif', 'flv', 'mp']:
+                            video = mutagen.File(media_filepath)
+                            if video is not None:
+                                utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                                date_str_iso = utc_dt.isoformat()
+                                
+                                if video.tags is None:
+                                    video.add_tags()
+                                
+                                tag_key = 'creation_time' if file_ext == 'flv' else 'DATE_RECORDED'
+                                video.tags[tag_key] = date_str_iso
+                                video.save()
+                                logging.info(f"  - Found and set {file_ext.upper()} internal creation date to: {date_str_iso}")
+                            else:
+                                logging.warning(f"  - Could not write internal metadata for '{filename}' (unsupported by mutagen).")
+
+                    except Exception as e:
+                        logging.warning(f"  - Failed to write internal metadata for '{filename}': {e}")
+
+                    # --- Always update file system date and move file ---
+                    os.utime(media_filepath, (timestamp, timestamp))
+                    logging.info(f"  - Set file 'Date modified' to match 'Date taken'.")
                     
-                    file_ext = filename.lower().split('.')[-1]
-
-                    # --- Handle JPG/JPEG/HEIC images ---
-                    if file_ext in ['jpg', 'jpeg', 'heic']:
-                        try:
-                            image = Image.open(media_filepath)
-                            exif_dict = piexif.load(image.info.get('exif', b''))
-                        except Exception as e:
-                            print(f"  - Could not load image or EXIF data: {e}. Creating new EXIF data.")
-                            exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
-                        
-                        date_str = dt_object.strftime("%Y:%m:%d %H:%M:%S")
-                        exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = date_str.encode('utf-8')
-                        exif_dict['Exif'][piexif.ExifIFD.DateTimeDigitized] = date_str.encode('utf-8')
-                        exif_dict['0th'][piexif.ImageIFD.DateTime] = date_str.encode('utf-8')
-                        print(f"  - Found and set EXIF date to: {date_str}")
-                        
-                        if 'geoData' in metadata and 'latitude' in metadata['geoData'] and metadata['geoData']['latitude'] != 0.0:
-                            lat = metadata['geoData']['latitude']
-                            lon = metadata['geoData']['longitude']
-                            exif_dict = set_gps_location(exif_dict, lat, lon)
-                            print(f"  - Found and set GPS to: Lat {lat}, Lon {lon}")
-                        
-                        exif_bytes = piexif.dump(exif_dict)
-                        
-                        if file_ext in ['jpg', 'jpeg']:
-                             piexif.insert(exif_bytes, media_filepath)
-                        elif file_ext == 'heic':
-                            image.save(media_filepath, exif=exif_bytes)
-
-
-                    # --- Handle Video/GIF files with Mutagen ---
-                    elif file_ext in ['mp4', 'mkv', 'gif', 'flv']:
-                        video = mutagen.File(media_filepath)
-                        if video is None:
-                            print(f"  - Could not process file with mutagen. Skipping.")
-                            skipped_files += 1
-                            continue
-                        
-                        utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-                        date_str_iso = utc_dt.isoformat()
-                        
-                        if video.tags is None:
-                            video.add_tags()
-                        
-                        # Use a generic date tag that works for many formats
-                        tag_key = 'creation_time' if file_ext == 'flv' else 'DATE_RECORDED'
-                        video.tags[tag_key] = date_str_iso
-                        video.save()
-                        print(f"  - Found and set {file_ext.upper()} creation date to: {date_str_iso}")
-
-                    if timestamp:
-                        os.utime(media_filepath, (timestamp, timestamp))
-                        print(f"  - Set file 'Date modified' to match 'Date taken'.")
+                    relative_path = os.path.relpath(os.path.dirname(media_filepath), root_directory)
+                    destination_dir = os.path.join(completed_directory, relative_path)
+                    os.makedirs(destination_dir, exist_ok=True)
                     
-                    shutil.move(media_filepath, os.path.join(completed_directory, filename))
-                    print(f"  - Moved '{filename}' to 'Completed' folder.")
+                    destination_filepath = os.path.join(destination_dir, filename)
+                    shutil.move(media_filepath, destination_filepath)
+                    logging.info(f"  - Moved '{filename}' to '{destination_dir}'")
                     
                     processed_files += 1
                     used_json_files.append(json_filepath)
-                    print(f"  - Successfully merged metadata into '{filename}'")
 
                 else:
-                    print("  - No 'photoTakenTime' found in JSON. Skipping metadata update.")
+                    logging.info("  - No 'photoTakenTime' found in JSON. Skipping metadata update.")
                     skipped_files += 1
 
             except Exception as e:
-                print(f"  - An unexpected error occurred while processing '{filename}': {e}")
+                logging.error(f"  - An unexpected error occurred while processing '{filename}': {e}")
                 skipped_files += 1
         else:
-            print(f"\nSkipping '{filename}': No corresponding JSON file found.")
+            logging.warning(f"\nSkipping '{filename}': No corresponding JSON file found.")
             skipped_files += 1
     
-    print("\n--------------------")
-    print("      COMPLETE      ")
-    print("--------------------")
-    print(f"Processed: {processed_files} files")
-    print(f"Skipped:   {skipped_files + len(raw_files)} files (including RAW files)")
+    logging.info("\n--------------------")
+    logging.info("      COMPLETE      ")
+    logging.info("--------------------")
+    logging.info(f"Processed: {processed_files} files")
+    logging.info(f"Skipped:   {skipped_files + len(all_raw_files)} files (including RAW files)")
 
     if used_json_files:
-        print("\n")
+        logging.info("\n")
         while True:
-            delete_choice = input(f"Do you want to delete the {len(used_json_files)} successfully used JSON files? (yes/no): ").lower().strip()
+            delete_choice = input(f"Do you want to delete the {len(list(set(used_json_files)))} successfully used JSON files? (yes/no): ").lower().strip()
             if delete_choice in ['yes', 'y', 'no', 'n']:
                 break
             else:
-                print("Invalid input. Please enter 'yes' or 'no'.")
+                logging.warning("Invalid input. Please enter 'yes' or 'no'.")
 
         if delete_choice in ['yes', 'y']:
             deleted_count = 0
-            print("\nDeleting JSON files...")
-            for json_file in used_json_files:
+            logging.info("\nDeleting JSON files...")
+            for json_file in list(set(used_json_files)):
                 try:
                     os.remove(json_file)
-                    print(f"  - Deleted '{os.path.basename(json_file)}'")
+                    logging.info(f"  - Deleted '{os.path.basename(json_file)}' from '{os.path.dirname(json_file)}'")
                     deleted_count += 1
                 except OSError as e:
-                    print(f"  - Error deleting '{os.path.basename(json_file)}': {e}")
-            print(f"\nSuccessfully deleted {deleted_count} JSON files.")
+                    logging.error(f"  - Error deleting '{json_file}': {e}")
+            logging.info(f"\nSuccessfully deleted {deleted_count} JSON files.")
         else:
-            print("\nSkipping JSON file deletion.")
+            logging.info("\nSkipping JSON file deletion.")
 
 
 if __name__ == '__main__':
