@@ -70,69 +70,81 @@ def set_gps_location(exif_dict, lat, lon):
 
 def find_json_for_media(media_filepath, all_json_files):
     """
-    Finds the corresponding JSON file for a given media file.
-    This corrected version handles case-insensitivity, Google Takeout's naming conventions
-    for edited/numbered files, and different filename truncation patterns.
+    Finds the corresponding JSON file for a given media file. This version
+    is robust against various Google Takeout naming conventions, including:
+    - Edited files ("-edited")
+    - Numbered/duplicate files ("(1)")
+    - Videos with .jpg JSONs ("video.mp4" -> "video.jpg.json")
+    - Truncated metadata suffixes ("...supplemental-metad.json")
     """
     media_filename = os.path.basename(media_filepath)
     base_name, ext = os.path.splitext(media_filename)
-
-    # Use lowercase versions for case-insensitive comparison
     base_name_lower = base_name.lower()
     ext_lower = ext.lower()
 
     media_dir = os.path.dirname(media_filepath)
-    # Create a map of lowercase JSON filenames to their original paths for efficient, case-insensitive lookup
     json_map_local = {os.path.basename(f).lower(): f for f in all_json_files if os.path.dirname(f) == media_dir}
 
-    # --- Phase 1: Match by Exact Filename Patterns ---
-    candidates = []
-
-    # Pattern for edited files: 'image-edited.jpg' -> 'image.jpg.json'
-    edited_match = re.search(r'(.+?)([-_]edited)$', base_name_lower)
+    # --- 1. Deconstruct the filename to find its core parts ---
+    core_name_lower = base_name_lower
+    number_part = ""
+    
+    edited_match = re.search(r'(.+?)([-_]edited)$', core_name_lower)
     if edited_match:
-        original_base = edited_match.group(1)
-        candidates.append(f"{original_base}{ext_lower}.json")
-        candidates.append(f"{original_base}{ext_lower}.supplemental-metadata.json")
+        core_name_lower = edited_match.group(1).strip()
+        logging.info(f"  - '{media_filename}' is an edited file. Targeting original's JSON...")
 
-    # Pattern for numbered files: 'image(1).jpg' -> 'image.jpg(1).json'
-    numbered_match = re.search(r'(.+?)(\(\d+\))$', base_name_lower)
+    numbered_match = re.search(r'(.+?)(\(\d+\))$', core_name_lower)
     if numbered_match:
-        original_base = numbered_match.group(1)
+        core_name_lower = numbered_match.group(1).strip()
         number_part = numbered_match.group(2)
-        candidates.append(f"{original_base}{ext_lower}{number_part}.json")
-        candidates.append(f"{original_base}{ext_lower}.supplemental-metadata{number_part}.json")
 
-    # Standard patterns for all files
-    candidates.extend([
-        f"{media_filename.lower()}.json",               # 'image.PNG.json'
-        f"{media_filename.lower()}.supplemental-metadata.json", # 'image.PNG.supplemental-metadata.json'
-        f"{base_name_lower}.json",                      # 'image.json'
-    ])
+    # --- 2. Build target base names to search for ---
+    
+    # For videos, the JSON might use .jpg instead of the video extension.
+    base_ext_combinations = [ext_lower]
+    if ext_lower in ['.mp4', '.mov', '.mkv', '.flv', '.mp']:
+        base_ext_combinations.append('.jpg')
 
-    # Check generated candidates in order of priority
-    for candidate in dict.fromkeys(candidates):
-        if candidate in json_map_local:
-            return json_map_local[candidate]
+    # Create a list of possible base names for the JSON file.
+    # e.g., for "photo(1).mp4", this would include "photo(1).mp4" and "photo(1).jpg"
+    target_bases = [f"{core_name_lower}{number_part}{combo_ext}" for combo_ext in base_ext_combinations]
+    
+    # Also add the base name without any extension for simpler JSONs like "photo(1).json"
+    target_bases.append(f"{core_name_lower}{number_part}")
 
-    # --- Phase 2: Match by Truncated Prefix ---
-    # Handles cases where one filename is a truncated version of the other.
-    for json_name_lower, json_path in json_map_local.items():
-        json_base_lower, _ = os.path.splitext(json_name_lower)
-        # Check if media name starts with json name OR json name starts with media name
-        if base_name_lower.startswith(json_base_lower) or json_base_lower.startswith(base_name_lower):
-            return json_path
+    # --- 3. Find Match: Exact, then Prefix ---
 
-    # --- Phase 3: Match by Content (Deep Search) ---
-    # Last resort for completely mismatched names.
-    logging.info(f"  - No filename match for '{media_filename}'. Starting deep search in JSON content...")
+    # A. Check for exact, full matches first (most reliable)
+    for base in target_bases:
+        # e.g., photo(1).jpg.supplemental-metadata.json
+        full_candidate = f"{base}.supplemental-metadata.json"
+        if full_candidate in json_map_local:
+            return json_map_local[full_candidate]
+        # e.g., photo(1).jpg.json
+        simple_candidate = f"{base}.json"
+        if simple_candidate in json_map_local:
+            return json_map_local[simple_candidate]
+
+    # B. If no exact match, check for prefix matches (handles truncated suffixes)
+    # We sort the json_map by key length, descending. This makes "foo.jpg.supplemental.json"
+    # match before "foo.jpg.json" or "foo.jpg.supple.json", which is more specific and correct.
+    sorted_json_names = sorted(json_map_local.keys(), key=len, reverse=True)
+
+    for base in target_bases:
+        for json_name in sorted_json_names:
+            if json_name.startswith(base + '.'): # Ensure it's a full prefix match
+                return json_map_local[json_name]
+
+    # --- 4. Fallback: Deep search by title in JSON content ---
+    target_filename_for_search = f"{core_name_lower}{number_part}{ext}"
+    
+    logging.info(f"  - No filename match for '{media_filename}'. Starting deep search for title '{target_filename_for_search}'...")
     for json_path in json_map_local.values():
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            # Check if the 'title' field in the JSON matches the media filename.
-            # This is useful when the JSON filename is completely different.
-            if data.get('title') == media_filename:
+            if data.get('title') == target_filename_for_search:
                 logging.info(f"  - Deep search SUCCESS: Found match in '{os.path.basename(json_path)}' by title.")
                 return json_path
         except (json.JSONDecodeError, IOError):
