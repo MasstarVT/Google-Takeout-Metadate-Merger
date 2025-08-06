@@ -70,53 +70,73 @@ def set_gps_location(exif_dict, lat, lon):
 
 def find_json_for_media(media_filepath, all_json_files):
     """
-    Finds the corresponding JSON file for a given media file from a list of all JSON files.
+    Finds the corresponding JSON file for a given media file.
+    This corrected version handles case-insensitivity, Google Takeout's naming conventions
+    for edited/numbered files, and different filename truncation patterns.
     """
     media_filename = os.path.basename(media_filepath)
     base_name, ext = os.path.splitext(media_filename)
 
-    # Create a map for quick lookups, storing full paths
-    json_map = {os.path.basename(f): f for f in all_json_files}
+    # Use lowercase versions for case-insensitive comparison
+    base_name_lower = base_name.lower()
+    ext_lower = ext.lower()
 
-    search_candidates = []
-    # Exact match first
-    search_candidates.append(f"{media_filename}.json")
-    search_candidates.append(f"{base_name}.json")
-
-    # Handle numbered files like 'image(1).jpg' -> 'image.jpg(1).json'
-    match = re.match(r'(.+?)\s*\(\d+\)$', base_name)
-    if match:
-        original_base = match.group(1).strip()
-        numbered_part = base_name[len(original_base):]
-        search_candidates.append(f"{original_base}{ext}{numbered_part}.json")
-
-    # Handle edited files like 'image-edited.jpg' -> 'image.jpg.json'
-    if base_name.lower().endswith(('-edited', '_edited')):
-        original_base = re.sub(r'[-_]edited$', '', base_name, flags=re.IGNORECASE)
-        search_candidates.append(f"{original_base}{ext}.json")
-        search_candidates.append(f"{original_base}.json")
-
-    for candidate in search_candidates:
-        if candidate in json_map:
-            return json_map[candidate]
-
-    # Broader search for cases where the JSON name is a subset of the media name
-    # e.g., media='Screenshot_20210216-201518_Reddit.jpg', json='Screenshot_20210216-201518.jpg.json'
     media_dir = os.path.dirname(media_filepath)
-    for json_path in all_json_files:
-        if os.path.dirname(json_path) == media_dir:
-            json_filename = os.path.basename(json_path)
-            # Check if the json filename (without its own .json ext) is a prefix of the media filename
-            json_base, _ = os.path.splitext(json_filename)
-            if media_filename.startswith(json_base):
-                return json_path
+    # Create a map of lowercase JSON filenames to their original paths for efficient, case-insensitive lookup
+    json_map_local = {os.path.basename(f).lower(): f for f in all_json_files if os.path.dirname(f) == media_dir}
 
-    # Final fallback for supplemental files
-    for json_path in all_json_files:
-        if os.path.dirname(json_path) == media_dir:
-            json_filename = os.path.basename(json_path)
-            if json_filename.startswith(media_filename) or json_filename.startswith(base_name):
-                 return json_path
+    # --- Phase 1: Match by Exact Filename Patterns ---
+    candidates = []
+
+    # Pattern for edited files: 'image-edited.jpg' -> 'image.jpg.json'
+    edited_match = re.search(r'(.+?)([-_]edited)$', base_name_lower)
+    if edited_match:
+        original_base = edited_match.group(1)
+        candidates.append(f"{original_base}{ext_lower}.json")
+        candidates.append(f"{original_base}{ext_lower}.supplemental-metadata.json")
+
+    # Pattern for numbered files: 'image(1).jpg' -> 'image.jpg(1).json'
+    numbered_match = re.search(r'(.+?)(\(\d+\))$', base_name_lower)
+    if numbered_match:
+        original_base = numbered_match.group(1)
+        number_part = numbered_match.group(2)
+        candidates.append(f"{original_base}{ext_lower}{number_part}.json")
+        candidates.append(f"{original_base}{ext_lower}.supplemental-metadata{number_part}.json")
+
+    # Standard patterns for all files
+    candidates.extend([
+        f"{media_filename.lower()}.json",               # 'image.PNG.json'
+        f"{media_filename.lower()}.supplemental-metadata.json", # 'image.PNG.supplemental-metadata.json'
+        f"{base_name_lower}.json",                      # 'image.json'
+    ])
+
+    # Check generated candidates in order of priority
+    for candidate in dict.fromkeys(candidates):
+        if candidate in json_map_local:
+            return json_map_local[candidate]
+
+    # --- Phase 2: Match by Truncated Prefix ---
+    # Handles cases where one filename is a truncated version of the other.
+    for json_name_lower, json_path in json_map_local.items():
+        json_base_lower, _ = os.path.splitext(json_name_lower)
+        # Check if media name starts with json name OR json name starts with media name
+        if base_name_lower.startswith(json_base_lower) or json_base_lower.startswith(base_name_lower):
+            return json_path
+
+    # --- Phase 3: Match by Content (Deep Search) ---
+    # Last resort for completely mismatched names.
+    logging.info(f"  - No filename match for '{media_filename}'. Starting deep search in JSON content...")
+    for json_path in json_map_local.values():
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            # Check if the 'title' field in the JSON matches the media filename.
+            # This is useful when the JSON filename is completely different.
+            if data.get('title') == media_filename:
+                logging.info(f"  - Deep search SUCCESS: Found match in '{os.path.basename(json_path)}' by title.")
+                return json_path
+        except (json.JSONDecodeError, IOError):
+            continue
 
     return None
 
@@ -125,8 +145,8 @@ def delete_empty_folders(root_dir):
     deleted_folders_count = 0
     # Walk the directory tree from the bottom up
     for dirpath, dirnames, filenames in os.walk(root_dir, topdown=False):
-        # Don't try to delete the root directory itself
-        if os.path.abspath(dirpath) == os.path.abspath(root_dir):
+        # Don't try to delete the root directory itself or the completed directory
+        if os.path.abspath(dirpath) == os.path.abspath(root_dir) or "Completed" in dirpath:
             continue
             
         if not dirnames and not filenames:
@@ -148,17 +168,8 @@ def main():
     completed_directory = os.path.join(root_directory, "Completed")
     log_file = os.path.join(root_directory, "metadata_merge.log")
 
-    # --- Setup Logging ---
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file, mode='w'), # 'w' to overwrite the log each run
-            logging.StreamHandler()
-        ]
-    )
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', handlers=[logging.FileHandler(log_file, mode='w'), logging.StreamHandler()])
     logging.info(f"Log file created at: {os.path.abspath(log_file)}")
-    # ---
 
     if not os.path.exists(completed_directory):
         os.makedirs(completed_directory)
@@ -169,22 +180,14 @@ def main():
     skipped_files = 0
     processed_media_basenames = set() 
 
-    # Add RAW file extensions to the list of supported files.
-    # They will be processed to update their file system timestamp, but their
-    # internal metadata will not be modified to prevent corruption.
     supported_extensions = ('.jpg', '.jpeg', '.mp4', '.mkv', '.heic', '.gif', '.flv', '.png', '.webp', '.mp', '.nef', '.cr2', '.arw', '.dng', '.mov')
     
-    all_media_files = []
-    all_json_files = []
-    
-    for dirpath, dirnames, filenames in os.walk(root_directory):
-        # Skip the 'Completed' directory during the initial file scan
+    all_media_files, all_json_files = [], []
+    for dirpath, _, filenames in os.walk(root_directory):
         if os.path.abspath(dirpath).startswith(os.path.abspath(completed_directory)):
             continue
-            
         for filename in filenames:
             full_path = os.path.join(dirpath, filename)
-            # Use os.path.splitext for a more reliable way to get the extension
             _, ext = os.path.splitext(filename)
             ext = ext.lower()
             if ext in supported_extensions:
@@ -194,13 +197,16 @@ def main():
 
     if not all_media_files:
         logging.info(f"No supported files found ({', '.join(supported_extensions)}).")
+        return
     
-    logging.info(f"Found {len(all_media_files)} supported files to process.")
-
+    logging.info(f"Found {len(all_media_files)} supported files to process and {len(all_json_files)} JSON files.")
+    
     for media_filepath in all_media_files:
         filename = os.path.basename(media_filepath)
+        
+        # --- Find the matching JSON file ---
         json_filepath = find_json_for_media(media_filepath, all_json_files)
-
+        
         if json_filepath:
             logging.info(f"\nProcessing '{media_filepath}' with JSON '{os.path.basename(json_filepath)}'...")
             try:
@@ -209,72 +215,58 @@ def main():
 
                 if 'photoTakenTime' in metadata and 'timestamp' in metadata['photoTakenTime']:
                     timestamp = int(metadata['photoTakenTime']['timestamp'])
-                    dt_object = datetime.fromtimestamp(timestamp)
-                    _, file_ext_with_dot = os.path.splitext(filename)
-                    file_ext = file_ext_with_dot.lower().replace('.', '')
-
-
-                    # --- Attempt to write internal metadata (EXIF, video tags) ---
+                    
+                    # --- Update internal metadata (where possible and safe) ---
                     try:
+                        _, file_ext_with_dot = os.path.splitext(filename)
+                        file_ext = file_ext_with_dot.lower().replace('.', '')
                         if file_ext in ['jpg', 'jpeg', 'heic', 'png', 'webp']:
                             exif_dict = {}
                             try:
                                 if file_ext in ['heic', 'png', 'webp']:
                                     with Image.open(media_filepath) as image:
                                         exif_dict = piexif.load(image.info.get('exif', b''))
-                                else: # For JPG/JPEG
+                                else:
                                     exif_dict = piexif.load(media_filepath)
                             except Exception:
-                                logging.info(f"  - No valid EXIF data in '{filename}'. Creating new EXIF data.")
                                 exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
                             
+                            dt_object = datetime.fromtimestamp(timestamp)
                             date_str = dt_object.strftime("%Y:%m:%d %H:%M:%S")
                             exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = date_str.encode('utf-8')
                             exif_dict['Exif'][piexif.ExifIFD.DateTimeDigitized] = date_str.encode('utf-8')
                             exif_dict['0th'][piexif.ImageIFD.DateTime] = date_str.encode('utf-8')
                             logging.info(f"  - Found and set EXIF date to: {date_str}")
                             
-                            if 'geoData' in metadata and 'latitude' in metadata['geoData'] and metadata['geoData']['latitude'] != 0.0:
-                                lat = metadata['geoData']['latitude']
-                                lon = metadata['geoData']['longitude']
+                            if 'geoData' in metadata and metadata['geoData'].get('latitude'):
+                                lat, lon = metadata['geoData']['latitude'], metadata['geoData']['longitude']
                                 exif_dict = set_gps_location(exif_dict, lat, lon)
                                 logging.info(f"  - Found and set GPS to: Lat {lat}, Lon {lon}")
-                            
-                            for ifd_name in exif_dict:
-                                if ifd_name == 'thumbnail':
-                                    continue
-                                keys_to_delete = [tag for tag, value in exif_dict[ifd_name].items() if isinstance(value, int)]
-                                if keys_to_delete:
-                                    for key in keys_to_delete:
-                                        del exif_dict[ifd_name][key]
                             
                             exif_dict['thumbnail'] = None
                             exif_bytes = piexif.dump(exif_dict)
                             
                             if file_ext in ['jpg', 'jpeg']:
                                  piexif.insert(exif_bytes, media_filepath)
-                            elif file_ext in ['heic', 'png', 'webp']:
+                            else:
                                 with Image.open(media_filepath) as image:
                                     image.save(media_filepath, exif=exif_bytes)
 
                         elif file_ext in ['mp4', 'mkv', 'gif', 'flv', 'mp', 'mov']:
-                            video = mutagen.File(media_filepath)
-                            if video is not None:
+                             video = mutagen.File(media_filepath)
+                             if video is not None:
                                 utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
                                 date_str_iso = utc_dt.isoformat()
-                                
-                                if video.tags is None:
-                                    video.add_tags()
-                                
+                                if video.tags is None: video.add_tags()
                                 tag_key = 'creation_time' if file_ext == 'flv' else 'DATE_RECORDED'
                                 video.tags[tag_key] = date_str_iso
                                 video.save()
                                 logging.info(f"  - Found and set {file_ext.upper()} internal creation date to: {date_str_iso}")
-                            else:
+                             else:
                                 logging.warning(f"  - Could not write internal metadata for '{filename}' (unsupported by mutagen).")
                         
                         elif file_ext in ['nef', 'cr2', 'arw', 'dng']:
-                             logging.info(f"  - Found RAW file. Internal metadata will not be changed.")
+                             logging.info(f"  - Found RAW file. Internal metadata will not be changed for safety.")
 
                     except Exception as e:
                         logging.warning(f"  - Failed to write internal metadata for '{filename}': {e}")
@@ -291,19 +283,15 @@ def main():
                     shutil.move(media_filepath, destination_filepath)
                     logging.info(f"  - Moved '{filename}' to '{destination_dir}'")
                     
-                    # Add the base name of the processed file to a set for later cleanup
                     base_name_for_cleanup, _ = os.path.splitext(filename)
-                    # Normalize names like 'IMG_1234(1)' or 'IMG_1234-edited' to get the true base
                     base_name_for_cleanup = re.sub(r'\(\d+\)$', '', base_name_for_cleanup)
                     base_name_for_cleanup = re.sub(r'[-_]edited$', '', base_name_for_cleanup, flags=re.IGNORECASE)
                     processed_media_basenames.add(base_name_for_cleanup)
                     
                     processed_files += 1
-
                 else:
                     logging.info("  - No 'photoTakenTime' found in JSON. Skipping metadata update.")
                     skipped_files += 1
-
             except Exception as e:
                 logging.error(f"  - An unexpected error occurred while processing '{filename}': {e}")
                 skipped_files += 1
@@ -311,36 +299,24 @@ def main():
             logging.warning(f"\nSkipping '{filename}': No corresponding JSON file found.")
             skipped_files += 1
     
-    logging.info("\n--------------------")
-    logging.info("      COMPLETE      ")
-    logging.info("--------------------")
+    logging.info("\n" + "-"*20 + "\n      COMPLETE      \n" + "-"*20)
     logging.info(f"Processed: {processed_files} files")
     logging.info(f"Skipped:   {skipped_files} files")
 
     if processed_media_basenames:
         logging.info("\n")
-        while True:
-            prompt_message = f"Do you want to delete all JSON files corresponding to the {len(processed_media_basenames)} successfully processed media items? (yes/no): "
-            delete_choice = input(prompt_message).lower().strip()
-            if delete_choice in ['yes', 'y', 'no', 'n']:
-                break
-            else:
-                logging.warning("Invalid input. Please enter 'yes' or 'no'.")
-
+        delete_choice = input(f"Do you want to delete all JSON files corresponding to the {len(processed_media_basenames)} successfully processed media items? (yes/no): ").lower().strip()
         if delete_choice in ['yes', 'y']:
             deleted_count = 0
             logging.info("\nDeleting related JSON files...")
-            # Re-iterate through all found JSON files to find all matches
             for json_path in all_json_files:
                 json_filename = os.path.basename(json_path)
-                # Check if this JSON file belongs to any of the processed media
                 for base_name in processed_media_basenames:
                     if json_filename.startswith(base_name):
                         try:
                             os.remove(json_path)
                             logging.info(f"  - Deleted '{os.path.basename(json_path)}' from '{os.path.dirname(json_path)}'")
                             deleted_count += 1
-                            # Once deleted, break inner loop to avoid trying to delete it again
                             break 
                         except OSError as e:
                             logging.error(f"  - Error deleting '{json_path}': {e}")
@@ -348,21 +324,13 @@ def main():
         else:
             logging.info("\nSkipping JSON file deletion.")
 
-    # --- Clean up empty folders ---
     logging.info("\n")
-    while True:
-        cleanup_choice = input("Do you want to delete any empty folders that are left? (yes/no): ").lower().strip()
-        if cleanup_choice in ['yes', 'y', 'no', 'n']:
-            break
-        else:
-            logging.warning("Invalid input. Please enter 'yes' or 'no'.")
-    
+    cleanup_choice = input("Do you want to delete any empty folders that are left? (yes/no): ").lower().strip()
     if cleanup_choice in ['yes', 'y']:
         logging.info("\nChecking for empty folders to delete...")
         delete_empty_folders(root_directory)
     else:
         logging.info("\nSkipping empty folder cleanup.")
-
 
 if __name__ == '__main__':
     main()
